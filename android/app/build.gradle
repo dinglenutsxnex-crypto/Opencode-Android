@@ -28,14 +28,20 @@ android {
     }
 
     buildTypes {
-        debug {
-            debuggable true
-        }
+        debug { debuggable true }
     }
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // Tell Chaquopy that our Python source root is opencode_out/
+    // so runner.py and python/ are both on sys.path at runtime
+    sourceSets {
+        main {
+            python.srcDirs = ["../../opencode_out"]
+        }
     }
 }
 
