@@ -24,13 +24,20 @@ jobs:
         with:
           python-version: '3.11'
 
-      # Build a stripped Python stdlib + pip packages into a zip
-      # that gets bundled as an Android asset
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Generate Gradle wrapper
+        working-directory: android
+        run: |
+          gradle wrapper --gradle-version 8.4
+          chmod +x gradlew
+
       - name: Build stripped Python runtime
         run: |
           pip install flask requests --target=/tmp/pypackages
-          
-          # Strip unnecessary files to minimize size
+
+          # Strip Linux binaries and junk — Chaquopy provides ARM versions
           find /tmp/pypackages -name "*.pyc" -delete
           find /tmp/pypackages -name "*.pyo" -delete
           find /tmp/pypackages -name "*.so" -delete
@@ -38,22 +45,16 @@ jobs:
           find /tmp/pypackages -name "tests" -type d -exec rm -rf {} + 2>/dev/null || true
           find /tmp/pypackages -name "*.dist-info" -type d -exec rm -rf {} + 2>/dev/null || true
           find /tmp/pypackages -name "*.egg-info" -type d -exec rm -rf {} + 2>/dev/null || true
-          
-          # Copy your app code into the bundle
+
+          # Bundle your app code
           cp -r opencode_out /tmp/pypackages/
-          
-          # Zip everything up for the asset
+
+          # Zip it all up
           cd /tmp/pypackages && zip -r /tmp/pyapp.zip . -x "*.pyc"
-          
+
           mkdir -p android/app/src/main/assets
           cp /tmp/pyapp.zip android/app/src/main/assets/pyapp.zip
           echo "pyapp.zip size: $(du -sh /tmp/pyapp.zip | cut -f1)"
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Make gradlew executable
-        run: chmod +x android/gradlew
 
       - name: Build debug APK
         working-directory: android
