@@ -2,16 +2,23 @@ package com.opencode.app;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.Intent;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
+import android.view.View;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
 
-import com.chaquo.python.PyObject;
 import com.chaquo.python.Python;
 import com.chaquo.python.android.AndroidPlatform;
 
@@ -28,58 +35,123 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        setupFullscreen();
+        requestFileAccess();
+
         webView = findViewById(R.id.webview);
         setupWebView();
         webView.loadData(LOADING_HTML, "text/html", "UTF-8");
         startFlaskServer();
 
-        new Handler(Looper.getMainLooper()).postDelayed(() -> {
-            webView.loadUrl(FLASK_URL);
-        }, SERVER_START_DELAY_MS);
+        new Handler(Looper.getMainLooper()).postDelayed(
+            () -> webView.loadUrl(FLASK_URL), SERVER_START_DELAY_MS);
     }
 
+    // ── Fullscreen ────────────────────────────────────────────────────────────
+
+    private void setupFullscreen() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Android 11+ (API 30+) — WindowInsetsController
+            // This also covers Android 15's new edge-to-edge enforcement
+            getWindow().setDecorFitsSystemWindows(false);
+            WindowInsetsController ctrl = getWindow().getInsetsController();
+            if (ctrl != null) {
+                ctrl.hide(WindowInsets.Type.statusBars()
+                        | WindowInsets.Type.navigationBars());
+                ctrl.setSystemBarsBehavior(
+                        WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            }
+        } else {
+            // Android 10 and below — legacy flags
+            getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                | View.SYSTEM_UI_FLAG_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            );
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        // Re-apply fullscreen when focus returns (e.g. after dialog/notification)
+        if (hasFocus) setupFullscreen();
+    }
+
+    // ── File access ───────────────────────────────────────────────────────────
+
+    private void requestFileAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Android 11+ — MANAGE_EXTERNAL_STORAGE requires special settings page
+            if (!Environment.isExternalStorageManager()) {
+                try {
+                    Intent intent = new Intent(
+                        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:" + getPackageName())
+                    );
+                    startActivity(intent);
+                } catch (Exception e) {
+                    // Fallback if the specific app page isn't available
+                    startActivity(new Intent(
+                        Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                }
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            // Android 6–10 — runtime permission request
+            requestPermissions(new String[]{
+                android.Manifest.permission.READ_EXTERNAL_STORAGE,
+                android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+            }, 1001);
+        }
+        // Below API 23 — permissions granted at install time, nothing to do
+    }
+
+    // ── Flask server ──────────────────────────────────────────────────────────
+
     private void startFlaskServer() {
-        Thread serverThread = new Thread(() -> {
+        Thread t = new Thread(() -> {
             try {
                 if (!Python.isStarted()) {
                     Python.start(new AndroidPlatform(this));
                 }
-                Python py = Python.getInstance();
-                // Just call runner directly — Chaquopy puts opencode_out on
-                // sys.path automatically since it's in the sources root
-                py.getModule("runner").callAttr("run");
-
+                Python.getInstance().getModule("runner").callAttr("run");
             } catch (Exception e) {
                 new Handler(Looper.getMainLooper()).post(() ->
                     Toast.makeText(this, "Server error: " + e.getMessage(),
-                        Toast.LENGTH_LONG).show()
-                );
+                        Toast.LENGTH_LONG).show());
             }
         });
-        serverThread.setDaemon(true);
-        serverThread.start();
+        t.setDaemon(true);
+        t.start();
     }
+
+    // ── WebView ───────────────────────────────────────────────────────────────
 
     @SuppressLint("SetJavaScriptEnabled")
     private void setupWebView() {
-        WebSettings settings = webView.getSettings();
-        settings.setJavaScriptEnabled(true);
-        settings.setDomStorageEnabled(true);
-        settings.setAllowFileAccess(true);
-        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        WebSettings s = webView.getSettings();
+        s.setJavaScriptEnabled(true);
+        s.setDomStorageEnabled(true);
+        s.setAllowFileAccess(true);
+        s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         webView.setWebViewClient(new WebViewClient() {
             @Override
-            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
-                return !req.getUrl().toString().startsWith("http://localhost");
+            public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                return !r.getUrl().toString().startsWith("http://localhost");
             }
         });
     }
 
     @Override
     public void onBackPressed() {
-        if (webView.canGoBack()) webView.goBack();
+        if (webView != null && webView.canGoBack()) webView.goBack();
         else super.onBackPressed();
     }
+
+    // ── Loading screen ────────────────────────────────────────────────────────
 
     private static final String LOADING_HTML =
         "<!DOCTYPE html><html><head>" +
