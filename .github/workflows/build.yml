@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout
@@ -61,4 +61,4 @@ jobs:
         with:
           name: opencode-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
-          retention-days: 30
+          retention-days: 1
