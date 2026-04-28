@@ -29,6 +29,9 @@ public class MainActivity extends Activity {
     private static final String FLASK_URL = "http://localhost:" + FLASK_PORT;
     private static final int SERVER_START_DELAY_MS = 2500;
 
+    // Tracks whether we sent the user to the Settings page for MANAGE_EXTERNAL_STORAGE
+    private boolean returningFromSettings = false;
+
     @SuppressLint("SetJavaScriptEnabled")
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -51,8 +54,6 @@ public class MainActivity extends Activity {
 
     private void setupFullscreen() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // Android 11+ (API 30+) — WindowInsetsController
-            // This also covers Android 15's new edge-to-edge enforcement
             getWindow().setDecorFitsSystemWindows(false);
             WindowInsetsController ctrl = getWindow().getInsetsController();
             if (ctrl != null) {
@@ -62,7 +63,6 @@ public class MainActivity extends Activity {
                         WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
             }
         } else {
-            // Android 10 and below — legacy flags
             getWindow().getDecorView().setSystemUiVisibility(
                 View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                 | View.SYSTEM_UI_FLAG_FULLSCREEN
@@ -77,7 +77,6 @@ public class MainActivity extends Activity {
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
-        // Re-apply fullscreen when focus returns (e.g. after dialog/notification)
         if (hasFocus) setupFullscreen();
     }
 
@@ -85,28 +84,35 @@ public class MainActivity extends Activity {
 
     private void requestFileAccess() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // Android 11+ — MANAGE_EXTERNAL_STORAGE requires special settings page
             if (!Environment.isExternalStorageManager()) {
+                returningFromSettings = true;
                 try {
-                    Intent intent = new Intent(
+                    startActivity(new Intent(
                         Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                        Uri.parse("package:" + getPackageName())
-                    );
-                    startActivity(intent);
+                        Uri.parse("package:" + getPackageName())));
                 } catch (Exception e) {
-                    // Fallback if the specific app page isn't available
                     startActivity(new Intent(
                         Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
                 }
             }
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            // Android 6–10 — runtime permission request
             requestPermissions(new String[]{
                 android.Manifest.permission.READ_EXTERNAL_STORAGE,
                 android.Manifest.permission.WRITE_EXTERNAL_STORAGE
             }, 1001);
         }
-        // Below API 23 — permissions granted at install time, nothing to do
+    }
+
+    // When user comes back from the MANAGE_EXTERNAL_STORAGE settings page,
+    // Flask is already running — just reload the WebView.
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (returningFromSettings) {
+            returningFromSettings = false;
+            new Handler(Looper.getMainLooper()).postDelayed(
+                () -> webView.loadUrl(FLASK_URL), 500);
+        }
     }
 
     // ── Flask server ──────────────────────────────────────────────────────────
