@@ -1,97 +1,414 @@
-const API_URL = '/chat';
+// ── State ─────────────────────────────────────────────────────────────
 let sending = false;
 let selectedModel = 'minimax-m2.5-free';
+let selectedModelCtx = 1000000; // context window tokens for active model
 
-const chat          = document.getElementById('chat');
-const input         = document.getElementById('input');
-const sendBtn       = document.getElementById('send');
-const clearBtn      = document.getElementById('clear');
-const modelBtn      = document.getElementById('model-btn');
-const modelLabel    = document.getElementById('model-label');
-const modelDropdown = document.getElementById('model-dropdown');
+function formatCtx(n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(0) + 'M';
+    if (n >= 1000) return Math.round(n / 1000) + 'k';
+    return String(n);
+}
 
-// ── Model selector ────────────────────────────────────────────────────
+// Each chat: { id, title, workingDirs: [], history: [], createdAt }
+let chats = [];
+let activeChatId = null;
 
-modelBtn.onclick = (e) => {
-    e.stopPropagation();
-    modelDropdown.classList.toggle('hidden');
+// ── DOM refs ──────────────────────────────────────────────────────────
+const chatEl       = document.getElementById('chat');
+const input        = document.getElementById('input');
+const sendBtn      = document.getElementById('send');
+const modelBtn     = document.getElementById('model-btn');
+const modelLabel   = document.getElementById('model-label');
+const modelDropdown= document.getElementById('model-dropdown');
+const sidebar      = document.getElementById('sidebar');
+const menuBtn      = document.getElementById('menu-btn');
+const folderBtn    = document.getElementById('folder-btn');
+const folderBar    = document.getElementById('folder-bar');
+const chatList     = document.getElementById('chat-list');
+const chatTitle    = document.getElementById('chat-title');
+const newChatBtn   = document.getElementById('new-chat-btn');
+const chatMenuBtn  = document.getElementById('chat-menu-btn');
+const chatMenu     = document.getElementById('chat-menu');
+const renameChatBtn= document.getElementById('rename-chat-btn');
+const deleteChatBtn= document.getElementById('delete-chat-btn');
+const renameModal  = document.getElementById('rename-modal');
+const renameInput  = document.getElementById('rename-input');
+const renameCancel = document.getElementById('rename-cancel');
+const renameConfirm= document.getElementById('rename-confirm');
+
+// ── Android bridge ────────────────────────────────────────────────────
+function androidBridge() { return window.Android; }
+
+// ── Storage dir path ──────────────────────────────────────────────────
+// We ask the backend for the opencode data dir on first load
+let storageDir = '';
+
+async function getStorageDir() {
+    try {
+        const r = await fetch('/storage_dir');
+        const d = await r.json();
+        storageDir = d.path || '';
+    } catch {}
+}
+
+// ── Chat persistence ──────────────────────────────────────────────────
+async function saveChats() {
+    try {
+        await fetch('/save_chats', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chats, activeChatId })
+        });
+    } catch {}
+}
+
+async function loadChats() {
+    try {
+        const r = await fetch('/load_chats');
+        const d = await r.json();
+        chats = d.chats || [];
+        activeChatId = d.activeChatId || null;
+    } catch {
+        chats = [];
+        activeChatId = null;
+    }
+}
+
+// ── Chat helpers ──────────────────────────────────────────────────────
+function activeChat() {
+    return chats.find(c => c.id === activeChatId) || null;
+}
+
+function createChat() {
+    const id = 'chat_' + Date.now();
+    const chat = { id, title: 'new chat', workingDirs: [], history: [], createdAt: Date.now() };
+    chats.unshift(chat);
+    return chat;
+}
+
+function truncatePath(p) {
+    // Show .../x/y/z — keep last 3 segments
+    const parts = p.replace(/\\/g, '/').split('/').filter(Boolean);
+    if (parts.length <= 3) return p;
+    return '…/' + parts.slice(-3).join('/');
+}
+
+// ── Folder bar ────────────────────────────────────────────────────────
+function renderFolderBar() {
+    const chat = activeChat();
+    const dirs = chat ? chat.workingDirs : [];
+    if (!dirs.length) {
+        folderBar.classList.add('hidden');
+        return;
+    }
+    folderBar.classList.remove('hidden');
+    folderBar.innerHTML = dirs.map((d, i) =>
+        `<span class="folder-chip-tag" title="${escHtml(d)}">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+            ${escHtml(truncatePath(d))}
+            <button class="folder-remove" data-idx="${i}" title="Remove folder">×</button>
+        </span>`
+    ).join('');
+    folderBar.querySelectorAll('.folder-remove').forEach(btn => {
+        btn.onclick = async () => {
+            const chat = activeChat();
+            if (!chat) return;
+            chat.workingDirs.splice(parseInt(btn.dataset.idx), 1);
+            await syncWorkingDirs();
+            renderFolderBar();
+            saveChats();
+        };
+    });
+}
+
+async function syncWorkingDirs() {
+    const chat = activeChat();
+    const dirs = chat ? chat.workingDirs : [];
+    try {
+        const resp = await fetch('/working_dirs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ working_dirs: dirs })
+        });
+        const data = await resp.json();
+        // If backend found invalid dirs (deleted/missing folders), remove them from chat
+        if (data.invalid_dirs && data.invalid_dirs.length && chat) {
+            const removed = new Set(data.invalid_dirs);
+            const before = chat.workingDirs.length;
+            chat.workingDirs = chat.workingDirs.filter(d => !removed.has(d));
+            if (chat.workingDirs.length !== before) {
+                renderFolderBar();
+                renderChatList();
+                saveChats();
+                // Show a brief notice
+                const notice = document.createElement('div');
+                notice.className = 'folder-removed-notice';
+                notice.textContent = `${removed.size} folder(s) no longer accessible and were removed.`;
+                const chatEl2 = document.getElementById('chat');
+                chatEl2.appendChild(notice);
+                setTimeout(() => notice.remove(), 4000);
+            }
+        }
+    } catch {}
+}
+
+// ── Chat list sidebar ─────────────────────────────────────────────────
+function renderChatList() {
+    if (!chats.length) {
+        chatList.innerHTML = '<div class="chat-list-empty">no chats yet</div>';
+        return;
+    }
+    chatList.innerHTML = chats.map(c =>
+        `<div class="chat-item ${c.id === activeChatId ? 'active' : ''}" data-id="${c.id}">
+            <div class="chat-item-inner">
+                <span class="chat-item-title">${escHtml(c.title)}</span>
+                ${c.workingDirs.length ? `<span class="chat-item-dir" title="${escHtml(c.workingDirs[0])}">${escHtml(truncatePath(c.workingDirs[0]))}</span>` : ''}
+            </div>
+        </div>`
+    ).join('');
+    chatList.querySelectorAll('.chat-item').forEach(el => {
+        el.onclick = () => switchChat(el.dataset.id);
+    });
+}
+
+async function switchChat(id) {
+    if (id === activeChatId) {
+        sidebar.classList.add('collapsed');
+        return;
+    }
+    activeChatId = id;
+    const chat = activeChat();
+    chatTitle.textContent = chat ? chat.title : 'new chat';
+
+    // Tell backend to load this chat's history
+    await fetch('/switch_chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: id, history: chat ? chat.history : [] })
+    });
+    await syncWorkingDirs();
+
+    renderChatList();
+    renderFolderBar();
+    renderHistory();
+    updateContextBadge();
+    saveChats();
+    sidebar.classList.add('collapsed');
+}
+
+function renderHistory() {
+    const chat = activeChat();
+    chatEl.innerHTML = '';
+    if (!chat || !chat.history.length) return;
+    for (const msg of chat.history) {
+        if (msg.role === 'user') {
+            addUserMsgStatic(msg.content);
+        } else if (msg.role === 'assistant') {
+            addAssistantMsgStatic(msg.content);
+        }
+    }
+    scrollBottom();
+}
+
+// ── Folder picker ─────────────────────────────────────────────────────
+folderBtn.onclick = () => {
+    const android = androidBridge();
+    if (android && android.openFolderPicker) {
+        android.openFolderPicker();
+    } else {
+        const path = prompt('Enter absolute folder path:');
+        if (path && path.trim()) addFolder(path.trim());
+    }
 };
 
-document.addEventListener('click', () => modelDropdown.classList.add('hidden'));
+async function addFolder(path) {
+    let chat = activeChat();
+    if (!chat) {
+        chat = createChat();
+        activeChatId = chat.id;
+    }
+    if (!chat.workingDirs.includes(path)) {
+        chat.workingDirs.push(path);
+    }
+    await syncWorkingDirs();
+    renderFolderBar();
+    renderChatList();
+    saveChats();
+}
 
+// Poll Android for folder changes
+setInterval(async () => {
+    const android = androidBridge();
+    if (!android || !android.getWorkingDir) return;
+    const newPath = android.getWorkingDir();
+    if (!newPath) return;
+    const chat = activeChat();
+    if (chat && !chat.workingDirs.includes(newPath)) {
+        await addFolder(newPath);
+        // Clear Android's pending path
+        if (android.clearWorkingDir) android.clearWorkingDir();
+    }
+}, 1000);
+
+// ── New chat ──────────────────────────────────────────────────────────
+newChatBtn.onclick = async () => {
+    const chat = createChat();
+    activeChatId = chat.id;
+    chatTitle.textContent = chat.title;
+    chatEl.innerHTML = '';
+    await fetch('/switch_chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chat.id, history: [] })
+    });
+    await syncWorkingDirs();
+    renderChatList();
+    renderFolderBar();
+    saveChats();
+    input.focus();
+    sidebar.classList.add('collapsed');
+};
+
+// ── Context badge (in header) ─────────────────────────────────────────
+const contextBadge = document.getElementById('context-badge');
+
+function updateContextBadge() {
+    if (!contextBadge) return;
+    const chat = activeChat();
+    const charCount = chat ? chat.history.reduce((n, m) => n + String(m.content || '').length, 0) : 0;
+    const tokEst = Math.round(charCount / 4);
+    const total = selectedModelCtx;
+    contextBadge.textContent = `${formatCtx(tokEst)}/${formatCtx(total)}`;
+    // Color hint: warn when >70%, red >90%
+    const pct = tokEst / total;
+    contextBadge.style.color = pct > 0.9 ? 'var(--err, #e05)' : pct > 0.7 ? 'var(--warn, #f90)' : '';
+}
+
+// ── Chat menu (⋮) ─────────────────────────────────────────────────────
+chatMenuBtn.onclick = (e) => {
+    e.stopPropagation();
+    chatMenu.classList.toggle('hidden');
+};
+document.addEventListener('click', () => {
+    chatMenu.classList.add('hidden');
+    modelDropdown.classList.add('hidden');
+    modelBtn.classList.remove('open');
+});
+
+renameChatBtn.onclick = (e) => {
+    e.stopPropagation();
+    chatMenu.classList.add('hidden');
+    const chat = activeChat();
+    if (!chat) return;
+    renameInput.value = chat.title === 'new chat' ? '' : chat.title;
+    renameModal.classList.remove('hidden');
+    renameInput.focus();
+};
+
+renameCancel.onclick = () => renameModal.classList.add('hidden');
+renameConfirm.onclick = doRename;
+renameInput.onkeydown = (e) => { if (e.key === 'Enter') doRename(); if (e.key === 'Escape') renameModal.classList.add('hidden'); };
+renameModal.onclick = (e) => { if (e.target === renameModal) renameModal.classList.add('hidden'); };
+
+function doRename() {
+    const val = renameInput.value.trim();
+    if (!val) return;
+    const chat = activeChat();
+    if (!chat) return;
+    chat.title = val;
+    chatTitle.textContent = val;
+    renderChatList();
+    saveChats();
+    renameModal.classList.add('hidden');
+}
+
+deleteChatBtn.onclick = async (e) => {
+    e.stopPropagation();
+    chatMenu.classList.add('hidden');
+    const chat = activeChat();
+    if (!chat) return;
+
+    // Delete the chat's JSON file from backend
+    await fetch('/delete_chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chat.id })
+    });
+
+    // Remove from local list and save updated index
+    chats = chats.filter(c => c.id !== chat.id);
+    activeChatId = chats.length ? chats[0].id : null;
+    await saveChats();
+
+    // Reload the page — cleanest way to reset all state
+    location.reload();
+};
+
+// ── Sidebar toggle ────────────────────────────────────────────────────
+menuBtn.onclick = () => sidebar.classList.toggle('collapsed');
+
+// ── Model selector ────────────────────────────────────────────────────
+modelBtn.onclick = (e) => {
+    e.stopPropagation();
+    const isHidden = modelDropdown.classList.toggle('hidden');
+    modelBtn.classList.toggle('open', !isHidden);
+};
 modelDropdown.querySelectorAll('.model-option').forEach(btn => {
     btn.onclick = (e) => {
         e.stopPropagation();
         selectedModel = btn.dataset.model;
+        selectedModelCtx = parseInt(btn.dataset.ctx || '128000', 10);
         modelLabel.textContent = btn.dataset.label;
         modelDropdown.querySelectorAll('.model-option').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
         modelDropdown.classList.add('hidden');
+        modelBtn.classList.remove('open');
+        updateContextBadge();
     };
 });
 
-// ── Markdown parser — code blocks extracted first, no formatting inside ──
-
+// ── Markdown / HTML helpers ───────────────────────────────────────────
 function escHtml(s) {
-    return String(s)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 function buildCodeBlock(lang, code) {
-    const displayLang = lang || 'code';
-    const safeCode = escHtml(code.trimEnd());
     return `<div class="code-block">` +
         `<div class="code-block-header">` +
-        `<span class="code-lang">${escHtml(displayLang)}</span>` +
+        `<span class="code-lang">${escHtml(lang||'code')}</span>` +
         `<button class="copy-btn" onclick="copyCode(this)">copy</button>` +
         `</div>` +
-        `<pre><code class="lang-${escHtml(lang)}">${safeCode}</code></pre>` +
+        `<pre><code class="lang-${escHtml(lang)}">${escHtml(code.trimEnd())}</code></pre>` +
         `</div>`;
 }
 
 function parseMarkdown(text) {
     if (!text) return '';
-
     const segments = [];
     const fence = /```(\w*)\n?([\s\S]*?)```/g;
-    let last = 0;
-    let m;
-
+    let last = 0, m;
     while ((m = fence.exec(text)) !== null) {
-        if (m.index > last) {
-            segments.push({ type: 'text', content: text.slice(last, m.index) });
-        }
-        segments.push({ type: 'code', lang: m[1] || '', content: m[2] });
+        if (m.index > last) segments.push({ type:'text', content: text.slice(last, m.index) });
+        segments.push({ type:'code', lang: m[1]||'', content: m[2] });
         last = m.index + m[0].length;
     }
-    if (last < text.length) {
-        segments.push({ type: 'text', content: text.slice(last) });
-    }
-
+    if (last < text.length) segments.push({ type:'text', content: text.slice(last) });
     return segments.map(seg => {
-        if (seg.type === 'code') {
-            return buildCodeBlock(seg.lang, seg.content);
-        }
-
+        if (seg.type === 'code') return buildCodeBlock(seg.lang, seg.content);
         let s = escHtml(seg.content);
         s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
         s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
-        s = s.replace(/__([^_\n]+)__/g,     '<strong>$1</strong>');
-        s = s.replace(/\*([^*\n]+)\*/g,     '<em>$1</em>');
-        s = s.replace(/_([^_\n]+)_/g,       '<em>$1</em>');
-        s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g,
-            '<a href="$2" target="_blank" rel="noopener">$1</a>');
+        s = s.replace(/__([^_\n]+)__/g, '<strong>$1</strong>');
+        s = s.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+        s = s.replace(/(^|[\s>])_([^_\n]+)_(?=[\s<,\.!?;:]|$)/gm, '$1<em>$2</em>');
+        s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
         s = s.replace(/^### (.+)$/gm, '<h3>$1</h3>');
         s = s.replace(/^## (.+)$/gm,  '<h2>$1</h2>');
         s = s.replace(/^# (.+)$/gm,   '<h1>$1</h1>');
         s = s.replace(/^[\*\-] (.+)$/gm, '<li>$1</li>');
         s = s.replace(/(<li>.*<\/li>\n?)+/g, mm => `<ul>${mm}</ul>`);
         s = s.replace(/^---$/gm, '<hr>');
-
-        const blocks = s.split(/\n\n+/);
-        return blocks.map(b => {
+        return s.split(/\n\n+/).map(b => {
             b = b.trim();
             if (!b) return '';
             if (/^<(div|ul|ol|h[1-6]|hr|blockquote)/.test(b)) return b;
@@ -105,35 +422,40 @@ window.copyCode = function(btn) {
     navigator.clipboard.writeText(code.textContent).then(() => {
         btn.textContent = 'copied!';
         btn.classList.add('copied');
-        setTimeout(() => {
-            btn.textContent = 'copy';
-            btn.classList.remove('copied');
-        }, 1800);
+        setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 1800);
     });
 };
 
 // ── DOM helpers ───────────────────────────────────────────────────────
+function scrollBottom() { chatEl.scrollTop = chatEl.scrollHeight; }
 
-function scrollBottom() {
-    chat.scrollTop = chat.scrollHeight;
-}
-
-function addUserMsg(content) {
+function addUserMsgStatic(content) {
     const div = document.createElement('div');
     div.className = 'msg user';
     const inner = document.createElement('div');
     inner.className = 'user-inner';
     inner.textContent = content;
     div.appendChild(inner);
-    chat.appendChild(div);
+    chatEl.appendChild(div);
+}
+
+function addUserMsg(content) {
+    addUserMsgStatic(content);
     scrollBottom();
+}
+
+function addAssistantMsgStatic(content) {
+    const div = document.createElement('div');
+    div.className = 'msg assistant';
+    div.innerHTML = `<span class="msg-prefix">assistant</span>` + parseMarkdown(content);
+    chatEl.appendChild(div);
 }
 
 function createAssistantShell() {
     const div = document.createElement('div');
     div.className = 'msg assistant streaming';
     div.innerHTML = `<span class="msg-prefix">assistant</span><span class="cursor"></span>`;
-    chat.appendChild(div);
+    chatEl.appendChild(div);
     scrollBottom();
     return div;
 }
@@ -148,33 +470,21 @@ function createThinkingBlock() {
     wrapper.className = 'thinking-wrapper';
     wrapper.innerHTML = `
         <button class="thinking-header">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none"
-                 stroke="currentColor" stroke-width="2" stroke-linecap="round">
-                <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
-                <circle cx="12" cy="12" r="10"/>
-                <line x1="12" y1="17" x2="12.01" y2="17"/>
-            </svg>
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><circle cx="12" cy="12" r="10"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
             <span class="thinking-label">thinking…</span>
-            <svg class="thinking-chevron" width="9" height="9" viewBox="0 0 24 24" fill="none"
-                 stroke="currentColor" stroke-width="2.5">
-                <polyline points="6 9 12 15 18 9"/>
-            </svg>
+            <svg class="thinking-chevron" width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
         </button>
         <div class="thinking-body open"></div>`;
-
-    chat.appendChild(wrapper);
+    chatEl.appendChild(wrapper);
     scrollBottom();
-
     const header = wrapper.querySelector('.thinking-header');
     const body   = wrapper.querySelector('.thinking-body');
     let open = true;
-
     header.onclick = () => {
         open = !open;
         body.classList.toggle('open', open);
         wrapper.classList.toggle('collapsed', !open);
     };
-
     return { wrapper, body, header };
 }
 
@@ -182,59 +492,110 @@ function sealThinking(block) {
     block.header.querySelector('.thinking-label').textContent = 'thought process';
 }
 
-function createToolPill(name, args) {
+function createToolGroup() {
+    const group = document.createElement('div');
+    group.className = 'tool-group';
+    chatEl.appendChild(group);
+    scrollBottom();
+    return group;
+}
+
+function createToolPill(name, args, group) {
+    const container = group || chatEl;
     const div = document.createElement('div');
     div.className = 'tool-pill';
-
     let icon, label;
     if (name === 'web_search') {
         icon = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="flex-shrink:0"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`;
-        label = `searching&nbsp;<em>${escHtml(args.query || '')}</em>`;
+        label = `searching&nbsp;<em>${escHtml(args.query||'')}</em>`;
+    } else if (name === 'glob') {
+        icon = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`;
+        label = `finding&nbsp;<em>${escHtml(args.pattern||'')}</em>`;
+    } else if (name === 'grep') {
+        icon = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`;
+        label = `searching&nbsp;<em>${escHtml(args.pattern||'')}</em>`;
+    } else if (name === 'read') {
+        icon = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`;
+        label = `reading&nbsp;<em>${escHtml(args.filePath||'')}</em>`;
+    } else if (name === 'write') {
+        icon = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>`;
+        label = `writing&nbsp;<em>${escHtml(args.filePath||'')}</em>`;
+    } else if (name === 'edit') {
+        icon = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>`;
+        label = `editing&nbsp;<em>${escHtml(args.filePath||'')}</em>`;
     } else {
-        icon = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>`;
-        label = `fetching&nbsp;<em>${escHtml((args.url || '').replace(/^https?:\/\//, '').slice(0, 55))}</em>`;
+        icon = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0"><circle cx="12" cy="12" r="10"/></svg>`;
+        label = `running&nbsp;<em>${escHtml(name)}</em>`;
     }
-
     div.innerHTML = `<span class="tool-spinner"></span>${icon}<span>${label}</span>`;
-    chat.appendChild(div);
+    container.appendChild(div);
     scrollBottom();
     return div;
 }
 
 function setLoading(on) {
-    sendBtn.disabled  = on;
-    clearBtn.disabled = on;
+    sendBtn.disabled = on;
     sendBtn.innerHTML = on
         ? `<span class="dots"><span></span><span></span><span></span></span>`
-        : `<svg width="13" height="13" viewBox="0 0 24 24" fill="none"
-               stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-               <line x1="22" y1="2" x2="11" y2="13"/>
-               <polygon points="22 2 15 22 11 13 2 9 22 2"/>
-           </svg>`;
+        : `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>`;
+}
+
+// ── Auto-title ────────────────────────────────────────────────────────
+async function autoTitle(userMsg) {
+    const chat = activeChat();
+    if (!chat || chat.title !== 'new chat') return;
+    // Use first ~6 words of user message
+    const words = userMsg.trim().split(/\s+/).slice(0, 6).join(' ');
+    chat.title = words.length > 40 ? words.slice(0, 40) + '…' : words;
+    chatTitle.textContent = chat.title;
+    renderChatList();
+    saveChats();
 }
 
 // ── Send ──────────────────────────────────────────────────────────────
-
 async function send() {
     if (sending) return;
     const userMsg = input.value.trim();
     if (!userMsg) return;
 
+    // Ensure we have an active chat
+    if (!activeChatId || !activeChat()) {
+        const chat = createChat();
+        activeChatId = chat.id;
+        chatTitle.textContent = chat.title;
+        await fetch('/switch_chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chat.id, history: [] })
+        });
+        await syncWorkingDirs();
+        renderChatList();
+    }
+
     input.value = '';
     input.style.height = 'auto';
     addUserMsg(userMsg);
+    autoTitle(userMsg);
 
     sending = true;
     setLoading(true);
 
-    // Per-turn state — each is a distinct DOM node, never shared
-    let thinkingBlock = null;   // current open thinking block
-    let assistantDiv  = null;   // current streaming assistant bubble
-    let toolPill      = null;   // current tool pill
+    let thinkingBlock = null;
+    let thinkingIndicator = null;
+    let assistantDiv  = null;
+    let toolPill      = null;
+    let toolGroup     = null;
     let assistantText = '';
 
+    const chat = activeChat();
+
+    // Issue 5: keep-alive ping every 20s to prevent connection timeout
+    let keepAliveTimer = setInterval(async () => {
+        try { await fetch('/ping', { method: 'GET' }); } catch {}
+    }, 20000);
+
     try {
-        const resp = await fetch(API_URL, {
+        const resp = await fetch('/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ message: userMsg, model: selectedModel })
@@ -249,7 +610,6 @@ async function send() {
             const { done, value } = await reader.read();
             if (done) break;
             buf += decoder.decode(value, { stream: true });
-
             const lines = buf.split('\n');
             buf = lines.pop();
 
@@ -261,59 +621,36 @@ async function send() {
                 try { ev = JSON.parse(raw); } catch { continue; }
 
                 switch (ev.type) {
-
                     case 'thinking': {
-                        // Thinking always comes before text/tool — create once per burst
-                        if (!thinkingBlock) {
-                            thinkingBlock = createThinkingBlock();
+                        if (!thinkingBlock) thinkingBlock = createThinkingBlock();
+                        // Issue 4: show active thinking indicator in the thinking header
+                        if (!thinkingBlock._indicator) {
+                            thinkingBlock._indicator = true;
+                            thinkingBlock.header.querySelector('.thinking-label').innerHTML =
+                                'thinking <span class="thinking-dots"><span></span><span></span><span></span></span>';
                         }
                         thinkingBlock.body.textContent += ev.text;
                         scrollBottom();
                         break;
                     }
-
                     case 'text': {
-                        // Seal thinking block when text starts arriving
-                        if (thinkingBlock) {
-                            sealThinking(thinkingBlock);
-                            thinkingBlock = null;
-                        }
-                        // Seal completed tool pill
-                        if (toolPill) {
-                            toolPill.classList.add('done');
-                            toolPill = null;
-                        }
-                        // Open new assistant shell if needed
-                        if (!assistantDiv) {
-                            assistantText = '';
-                            assistantDiv  = createAssistantShell();
-                        }
+                        if (thinkingBlock) { sealThinking(thinkingBlock); thinkingBlock = null; }
+                        if (toolPill) { toolPill.classList.add('done'); toolPill = null; toolGroup = null; }
+                        if (!assistantDiv) { assistantText = ''; assistantDiv = createAssistantShell(); }
                         assistantText += ev.text;
-                        assistantDiv.innerHTML = `<span class="msg-prefix">assistant</span>`
-                            + parseMarkdown(assistantText)
-                            + '<span class="cursor"></span>';
+                        assistantDiv.innerHTML = `<span class="msg-prefix">assistant</span>` + parseMarkdown(assistantText) + '<span class="cursor"></span>';
                         scrollBottom();
                         break;
                     }
-
                     case 'tool_use': {
-                        // Seal everything open before showing tool pill
-                        if (thinkingBlock) {
-                            sealThinking(thinkingBlock);
-                            thinkingBlock = null;
-                        }
-                        if (assistantDiv) {
-                            sealAssistant(assistantDiv, assistantText);
-                            assistantDiv  = null;
-                            assistantText = '';
-                        }
-                        if (toolPill) {
-                            toolPill.classList.add('done');
-                        }
-                        toolPill = createToolPill(ev.name, ev.args);
+                        if (thinkingBlock) { sealThinking(thinkingBlock); thinkingBlock = null; }
+                        if (assistantDiv) { sealAssistant(assistantDiv, assistantText); assistantDiv = null; assistantText = ''; }
+                        // Issue 3: group tools together in a single container block
+                        if (!toolGroup) toolGroup = createToolGroup();
+                        if (toolPill) toolPill.classList.add('done');
+                        toolPill = createToolPill(ev.name, ev.args, toolGroup);
                         break;
                     }
-
                     case 'tool_done': {
                         if (toolPill) {
                             const spinner = toolPill.querySelector('.tool-spinner');
@@ -321,7 +658,15 @@ async function send() {
                         }
                         break;
                     }
-
+                    case 'history_update': {
+                        // Backend sends updated history after each round
+                        if (chat) {
+                            chat.history = ev.history;
+                            saveChats();
+                            updateContextBadge();
+                        }
+                        break;
+                    }
                     case 'error': {
                         if (thinkingBlock) { sealThinking(thinkingBlock); thinkingBlock = null; }
                         if (!assistantDiv) { assistantText = ''; assistantDiv = createAssistantShell(); }
@@ -330,50 +675,68 @@ async function send() {
                         assistantDiv = null;
                         break;
                     }
-
                     case 'done': {
                         if (thinkingBlock) { sealThinking(thinkingBlock); thinkingBlock = null; }
                         if (assistantDiv)  { sealAssistant(assistantDiv, assistantText); assistantDiv = null; }
-                        if (toolPill)      { toolPill.classList.add('done'); toolPill = null; }
+                        if (toolPill)      { toolPill.classList.add('done'); toolPill = null; toolGroup = null; }
                         break;
                     }
                 }
             }
         }
 
-        // Safety net
         if (thinkingBlock) sealThinking(thinkingBlock);
         if (assistantDiv)  sealAssistant(assistantDiv, assistantText);
         if (toolPill)      toolPill.classList.add('done');
 
     } catch (e) {
+        clearInterval(keepAliveTimer);
         const d = assistantDiv || createAssistantShell();
         d.classList.remove('streaming');
         d.innerHTML = `<span class="msg-prefix">assistant</span><span class="error-msg">⚠ ${escHtml(e.message)}</span>`;
     }
 
+    clearInterval(keepAliveTimer);
     sending = false;
     setLoading(false);
     input.focus();
 }
 
-// ── Controls ──────────────────────────────────────────────────────────
-
-clearBtn.onclick = async () => {
-    try { await fetch('/clear', { method: 'POST' }); } catch {}
-    chat.innerHTML = '';
-};
-
 sendBtn.onclick = send;
-
-input.onkeydown = e => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
-};
-
+input.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } };
 input.oninput = () => {
     input.style.height = 'auto';
     input.style.height = Math.min(input.scrollHeight, 120) + 'px';
 };
 
-setLoading(false);
-input.focus();
+// ── Init ──────────────────────────────────────────────────────────────
+async function init() {
+    await getStorageDir();
+    await loadChats();
+
+    if (chats.length && activeChatId) {
+        const chat = activeChat();
+        if (chat) {
+            chatTitle.textContent = chat.title;
+            await fetch('/switch_chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat_id: chat.id, history: chat.history })
+            });
+            await syncWorkingDirs();
+            renderHistory();
+            updateContextBadge();
+        }
+    } else if (!chats.length) {
+        const chat = createChat();
+        activeChatId = chat.id;
+        saveChats();
+    }
+
+    renderChatList();
+    renderFolderBar();
+    setLoading(false);
+    input.focus();
+}
+
+init();

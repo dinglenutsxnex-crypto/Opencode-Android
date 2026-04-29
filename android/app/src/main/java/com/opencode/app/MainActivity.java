@@ -3,6 +3,7 @@ package com.opencode.app;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -10,27 +11,45 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
+import android.util.Log;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.webkit.JavascriptInterface;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
 
-import com.chaquo.python.Python;
-import com.chaquo.python.android.AndroidPlatform;
+import com.libtermux.libtermux.LibTermux;
+import com.libtermux.libtermux.TermuxConstants;
+import com.libtermux.libtermux.TermuxBridge;
+import com.libtermux.libtermux.LogLevel;
+import com.libtermux.libtermux.InstallState;
+import com.libtermux.view.TerminalView;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
 
 public class MainActivity extends Activity {
 
+    private static final String TAG = "OpenCode";
     private WebView webView;
+    private TerminalView terminalView;
+    private LibTermux termux;
+    private TermuxBridge bridge;
     private static final int FLASK_PORT = 5000;
     private static final String FLASK_URL = "http://localhost:" + FLASK_PORT;
-    private static final int SERVER_START_DELAY_MS = 2500;
+    private static final int SERVER_START_DELAY_MS = 3500;
+    private static final int REQUEST_FOLDER_PICKER = 100;
 
-    // Tracks whether we sent the user to the Settings page for MANAGE_EXTERNAL_STORAGE
     private boolean returningFromSettings = false;
+    private SharedPreferences prefs;
+    private String selectedFolderPath;
+    private String storageFolderPath;
+    private boolean isInitialized = false;
 
     @SuppressLint("SetJavaScriptEnabled")
     @Override
@@ -38,19 +57,95 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        prefs = getSharedPreferences("opencode", MODE_PRIVATE);
+        selectedFolderPath = prefs.getString("working_dir", "");
+        storageFolderPath = prefs.getString("storage_dir", "");
+
+        if (storageFolderPath == null || storageFolderPath.isEmpty()) {
+            File extStorage = Environment.getExternalStorageDirectory();
+            storageFolderPath = new File(extStorage, "opencode").getAbsolutePath();
+        }
+
+        File storageDir = new File(storageFolderPath);
+        if (!storageDir.exists()) {
+            storageDir.mkdirs();
+        }
+
+        try {
+            File storageFile = new File(getApplicationContext().getFilesDir(), "storage_dir.txt");
+            java.io.FileWriter writer = new java.io.FileWriter(storageFile);
+            writer.write(storageFolderPath);
+            writer.close();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
         setupFullscreen();
         requestFileAccess();
 
+        terminalView = findViewById(R.id.terminalview);
         webView = findViewById(R.id.webview);
-        setupWebView();
-        webView.loadData(LOADING_HTML, "text/html", "UTF-8");
-        startFlaskServer();
+
+        initLibTermux();
+    }
+
+    private void initLibTermux() {
+        termux = LibTermux.builder(this)
+            .autoInstall(true)
+            .logLevel(LogLevel.DEBUG)
+            .build();
+
+        new Thread(() -> {
+            try {
+                termux.initializeBlocking();
+                bridge = termux.getBridge();
+                isInitialized = true;
+
+                runOnUiThread(() -> {
+                    setupTerminalWithLibTermux();
+                    setupWebView();
+                    webView.loadData(LOADING_HTML, "text/html", "UTF-8");
+                    startFlaskServer();
+                });
+            } catch (Exception e) {
+                Log.e(TAG, "LibTermux init failed", e);
+                runOnUiThread(() -> {
+                    Toast.makeText(this, "Init error: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                    setupWebView();
+                });
+            }
+        }).start();
+    }
+
+    private void setupTerminalWithLibTermux() {
+        if (bridge == null) return;
+
+        terminalView.setTextSize(14);
+        
+        try {
+            TerminalSession session = termux.getSessions().createSession("main");
+            terminalView.attachSession(session);
+            session.run("bash");
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to create terminal session", e);
+        }
+    }
+
+    private void startFlaskServer() {
+        new Thread(() -> {
+            try {
+                bridge.run("cd " + storageFolderPath + " && mkdir -p opencode 2>/dev/null");
+                
+                String pipCmd = "pip3 install flask requests -q 2>/dev/null || pip install flask requests -q 2>/dev/null";
+                bridge.run(pipCmd);
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to setup Python", e);
+            }
+        }).start();
 
         new Handler(Looper.getMainLooper()).postDelayed(
             () -> webView.loadUrl(FLASK_URL), SERVER_START_DELAY_MS);
     }
-
-    // ── Fullscreen ────────────────────────────────────────────────────────────
 
     private void setupFullscreen() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -80,8 +175,6 @@ public class MainActivity extends Activity {
         if (hasFocus) setupFullscreen();
     }
 
-    // ── File access ───────────────────────────────────────────────────────────
-
     private void requestFileAccess() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (!Environment.isExternalStorageManager()) {
@@ -103,8 +196,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    // When user comes back from the MANAGE_EXTERNAL_STORAGE settings page,
-    // Flask is already running — just reload the WebView.
     @Override
     protected void onResume() {
         super.onResume();
@@ -115,27 +206,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ── Flask server ──────────────────────────────────────────────────────────
-
-    private void startFlaskServer() {
-        Thread t = new Thread(() -> {
-            try {
-                if (!Python.isStarted()) {
-                    Python.start(new AndroidPlatform(this));
-                }
-                Python.getInstance().getModule("runner").callAttr("run");
-            } catch (Exception e) {
-                new Handler(Looper.getMainLooper()).post(() ->
-                    Toast.makeText(this, "Server error: " + e.getMessage(),
-                        Toast.LENGTH_LONG).show());
-            }
-        });
-        t.setDaemon(true);
-        t.start();
-    }
-
-    // ── WebView ───────────────────────────────────────────────────────────────
-
     @SuppressLint("SetJavaScriptEnabled")
     private void setupWebView() {
         WebSettings s = webView.getSettings();
@@ -143,6 +213,7 @@ public class MainActivity extends Activity {
         s.setDomStorageEnabled(true);
         s.setAllowFileAccess(true);
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        webView.addJavascriptInterface(new AndroidBridge(), "Android");
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
@@ -151,13 +222,148 @@ public class MainActivity extends Activity {
         });
     }
 
+    class AndroidBridge {
+        @JavascriptInterface
+        public String getWorkingDir() {
+            return selectedFolderPath != null ? selectedFolderPath : "";
+        }
+
+        @JavascriptInterface
+        public void setWorkingDir(String path) {
+            selectedFolderPath = path;
+            prefs.edit().putString("working_dir", path).apply();
+        }
+
+        @JavascriptInterface
+        public void openFolderPicker() {
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+            startActivityForResult(intent, REQUEST_FOLDER_PICKER);
+        }
+
+        @JavascriptInterface
+        public String listFiles(String path) {
+            if (path == null || path.isEmpty()) {
+                path = Environment.getExternalStorageDirectory().getAbsolutePath();
+            }
+            File dir = new File(path);
+            if (!dir.exists() || !dir.isDirectory()) {
+                return "[]";
+            }
+            List<String> files = new ArrayList<>();
+            File[] items = dir.listFiles();
+            if (items != null) {
+                for (File f : items) {
+                    files.add(f.getName() + (f.isDirectory() ? "/" : ""));
+                }
+            }
+            return files.toString();
+        }
+
+        @JavascriptInterface
+        public void runInTerminal(String command) {
+            if (isInitialized && bridge != null) {
+                try {
+                    bridge.run(command);
+                } catch (Exception e) {
+                    Log.e(TAG, "Terminal command failed", e);
+                }
+            }
+        }
+
+        @JavascriptInterface
+        public void toggleTerminal() {
+            runOnUiThread(() -> {
+                if (webView.getVisibility() == View.VISIBLE) {
+                    webView.setVisibility(View.GONE);
+                    terminalView.setVisibility(View.VISIBLE);
+                } else {
+                    webView.setVisibility(View.VISIBLE);
+                    terminalView.setVisibility(View.GONE);
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public String runCommand(String command) {
+            if (isInitialized && bridge != null) {
+                try {
+                    return bridge.run(command).getStdout();
+                } catch (Exception e) {
+                    return "Error: " + e.getMessage();
+                }
+            }
+            return "LibTermux not initialized";
+        }
+
+        @JavascriptInterface
+        public String getPythonVersion() {
+            if (isInitialized && bridge != null) {
+                try {
+                    return bridge.run("python3 --version").getStdout();
+                } catch (Exception e) {
+                    return "Error: " + e.getMessage();
+                }
+            }
+            return "Not initialized";
+        }
+    }
+
     @Override
     public void onBackPressed() {
         if (webView != null && webView.canGoBack()) webView.goBack();
         else super.onBackPressed();
     }
 
-    // ── Loading screen ────────────────────────────────────────────────────────
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_FOLDER_PICKER && resultCode == RESULT_OK && data != null) {
+            Uri treeUri = data.getData();
+            if (treeUri == null) return;
+            
+            getContentResolver().takePersistableUriPermission(treeUri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+
+            String path = treeUri.getPath();
+            String authority = treeUri.getAuthority();
+
+            if (path != null) {
+                if ("com.android.providers.downloads.documents".equals(authority)) {
+                    selectedFolderPath = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).getAbsolutePath();
+                } 
+                else if (path.contains(":")) {
+                    String[] split = path.split(":", 2); 
+                    String type = split[0];
+                    String relativePath = split.length > 1 ? split[1] : "";
+
+                    if (type.endsWith("primary")) {
+                        selectedFolderPath = Environment.getExternalStorageDirectory().getAbsolutePath();
+                        if (!relativePath.isEmpty()) {
+                            selectedFolderPath += "/" + relativePath;
+                        }
+                    } else {
+                        String volumeId = type.substring(type.lastIndexOf('/') + 1);
+                        selectedFolderPath = "/storage/" + volumeId;
+                        if (!relativePath.isEmpty()) {
+                            selectedFolderPath += "/" + relativePath;
+                        }
+                    }
+                } else {
+                    selectedFolderPath = path;
+                }
+            }
+
+            prefs.edit().putString("working_dir", selectedFolderPath).apply();
+
+            final String finalPath = selectedFolderPath;
+            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                if (webView != null) {
+                    String escaped = finalPath.replace("\\", "\\\\").replace("'", "\\'");
+                    webView.evaluateJavascript("setWorkingDir('" + escaped + "')", null);
+                }
+            }, 500);
+        }
+    }
 
     private static final String LOADING_HTML =
         "<!DOCTYPE html><html><head>" +
